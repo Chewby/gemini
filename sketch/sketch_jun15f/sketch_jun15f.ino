@@ -15,9 +15,14 @@ const byte BUTTON_PINS[] = {A5, A4, A3, A2, A1, A0};
 const byte RELAY1_PIN = 12; // PD6
 const byte RELAY2_PIN = 6;  // PD7
 
+// === PINS SERVOS (PWM) ===
+// PB5 = Arduino D9 (OC1A)  |  PB6 = Arduino D10 (OC1B)
+const byte SERVO1_PIN = 9;  // PB5
+const byte SERVO2_PIN = 10; // PB6
+
 // Variables temporelles
 unsigned long alarmStartTime, lastButtonActivity, lastDebounceTime[6], previousClockMillis;
-const unsigned int BACKLIGHT_TIMEOUT = 30000, DEBOUNCE_DELAY = 50, CLOCK_UPDATE_INTERVAL = 1000, ALARM_DURATION = 1000;
+const unsigned int BACKLIGHT_TIMEOUT = 30000, DEBOUNCE_DELAY = 50, CLOCK_UPDATE_INTERVAL = 1000, ALARM_DURATION = 1000, SERVO_DURATION = 1000;
 
 // Variables d'état
 struct {
@@ -37,24 +42,32 @@ struct {
 } state;
 
 // EEPROM addresses
-enum { EEPROM_MINUTES = 0, EEPROM_SECONDS = 4, EEPROM_MODE = 8, EEPROM_ALARM_YEAR = 12, 
-       EEPROM_ALARM_MONTH = 16, EEPROM_ALARM_DAY = 20, EEPROM_ALARM_HOUR = 24, 
-       EEPROM_ALARM_MINUTE = 28, EEPROM_BACKLIGHT = 32, EEPROM_COMPILE_TIME = 36 };
+enum { EEPROM_MINUTES = 0, EEPROM_SECONDS = 4, EEPROM_MODE = 8, EEPROM_ALARM_YEAR = 12,
+       EEPROM_ALARM_MONTH = 16, EEPROM_ALARM_DAY = 20, EEPROM_ALARM_HOUR = 24,
+       EEPROM_ALARM_MINUTE = 28, EEPROM_BACKLIGHT = 32, EEPROM_OUTPUT = 40 };
 
 // Modes et menu
 enum TimerMode : byte { MODE_SIMPLE, MODE_REPEAT, MODE_ALARM, MODE_ALARM_DAILY };
-enum MenuState : byte { MENU_MAIN, MENU_SET_TIME, MENU_SET_ALARM, MENU_SET_DATETIME, TIMER_RUNNING, TIMER_FINISHED, ALARM_WAITING, MENU_TEST_RELAY };
+enum MenuState : byte { MENU_MAIN, MENU_SET_TIME, MENU_SET_ALARM, MENU_SET_DATETIME, MENU_SET_OUTPUT, TIMER_RUNNING, TIMER_FINISHED, ALARM_WAITING, MENU_TEST_OUTPUT };
+
+// Flags pour sélection multiple des sorties (bits flags)
+#define OUTPUT_RELAY1_BIT  0b00000001
+#define OUTPUT_RELAY2_BIT  0b00000010
+#define OUTPUT_SERVO1_BIT  0b00000100
+#define OUTPUT_SERVO2_BIT  0b00001000
 
 TimerMode currentTimerMode = MODE_SIMPLE;
+byte selectedOutputs = OUTPUT_RELAY1_BIT;  // Par défaut, Relais 1 activé
 MenuState currentMenu = MENU_MAIN;
 byte menuSelection = 0;
 byte timeSetSelection = 0;
 byte alarmSetSelection = 0;
 byte dateTimeSetSelection = 0;
+byte outputSelection = 0;
 byte cycleCount = 0;
 
-// Sélection pour le mode test relais
-byte relayTestSelection = 0; // 0 = RELAY1 (PD6/D12), 1 = RELAY2 (PD7/D6)
+// Sélection pour le mode test output
+byte outputTestSelection = 0; // 0 = RELAY1, 1 = RELAY2, 2 = SERVO1, 3 = SERVO2
 
 // Variables timer/alarme
 int timerMinutes = 5, timerSeconds = 0;
@@ -144,7 +157,9 @@ void loadSettings() {
   byte backlight;
   EEPROM.get(EEPROM_BACKLIGHT, backlight);
   state.lcdBacklightOn = (backlight <= 1) ? (backlight == 1) : true;
-  
+
+  EEPROM.get(EEPROM_OUTPUT, selectedOutputs);
+
   // Validation
   timerMinutes = constrain(timerMinutes, 0, 99);
   timerSeconds = constrain(timerSeconds, 0, 59);
@@ -154,6 +169,7 @@ void loadSettings() {
   alarmDay = constrain(alarmDay, 1, 31);
   alarmHour = constrain(alarmHour, 0, 23);
   alarmMinute = constrain(alarmMinute, 0, 59);
+  selectedOutputs = constrain(selectedOutputs, 0, 0x0F); // Valider (seulement 4 bits utilisés)
   
   state.lcdBacklightActive = state.lcdBacklightOn;
   lastButtonActivity = millis();
@@ -177,6 +193,7 @@ void saveSettings() {
   EEPROM.put(EEPROM_ALARM_HOUR, alarmHour);
   EEPROM.put(EEPROM_ALARM_MINUTE, alarmMinute);
   EEPROM.put(EEPROM_BACKLIGHT, (byte)state.lcdBacklightOn);
+  EEPROM.put(EEPROM_OUTPUT, selectedOutputs);
   smartPrintln(F("Settings saved"));
 }
 
@@ -204,21 +221,21 @@ void printDate(int d, int m, int y = -1, bool shortYear = false) {
 
 void displayMainMenu() {
   DateTime now = rtc.now();
-  
+
   if (!state.mainMenuInit) {
     lcd.clear();
 
-    // Menu à 6 options avec navigation
+    // Menu à 7 options avec navigation
     const char* items[] = {"Mode: ",
                           (currentTimerMode == MODE_ALARM || currentTimerMode == MODE_ALARM_DAILY) ? "Regler Alarme" : "Regler Temps",
                           (currentTimerMode == MODE_ALARM || currentTimerMode == MODE_ALARM_DAILY) ?
                             (currentTimerMode == MODE_ALARM ? "Start Alarme" : "Start Daily") : "Start",
-                          "Regler Heure", "Retro: ", "Test Relais"};
+                          "Regler Heure", "Sortie: ", "Retro: ", "Test Output"};
 
-    byte start = constrain(menuSelection - 1, 0, 3);
+    byte start = constrain(menuSelection - 1, 0, 4);
     for (byte i = 0; i < 3; i++) {
       byte idx = start + i;
-      if (idx < 6) {
+      if (idx < 7) {
         lcd.setCursor(0, i + 1);
         lcd.print(menuSelection == idx ? "> " : "  ");
         lcd.print(items[idx]);
@@ -230,6 +247,12 @@ void displayMainMenu() {
           lcd.print(" ("); lcd.print(timerMinutes); lcd.print(":");
           if (timerSeconds < 10) lcd.print("0"); lcd.print(timerSeconds); lcd.print(")");
         } else if (idx == 4) {
+          // Afficher les sorties actives (R1 R2 S1 S2)
+          if (selectedOutputs & OUTPUT_RELAY1_BIT) lcd.print("R1");
+          if (selectedOutputs & OUTPUT_RELAY2_BIT) lcd.print("R2");
+          if (selectedOutputs & OUTPUT_SERVO1_BIT) lcd.print("S1");
+          if (selectedOutputs & OUTPUT_SERVO2_BIT) lcd.print("S2");
+        } else if (idx == 5) {
           lcd.print(state.lcdBacklightOn ? "ON" : "OFF");
           if (state.lcdBacklightOn && !state.lcdBacklightActive) lcd.print("*");
         }
@@ -237,7 +260,7 @@ void displayMainMenu() {
     }
     state.mainMenuInit = true;
   }
-  
+
   // Affichage de l'heure AVEC L'ANNÉE sur 2 chiffres
   lcd.setCursor(0, 0);
   // Effacer la ligne complètement
@@ -328,7 +351,7 @@ void displaySetAlarmMenu() {
 void displaySetDateTimeMenu() {
   lcd.clear();
   lcd.print(F("REGLAGE HEURE"));
-  
+
   lcd.setCursor(0, 1);
   // Date: jour/mois/année
   if (dateTimeSetSelection == 0) lcd.print(">");
@@ -344,7 +367,7 @@ void displaySetDateTimeMenu() {
   if (dateTimeSetSelection == 2) lcd.print(">");
   lcd.print(rtcYear);
   if (dateTimeSetSelection == 2) lcd.print("<");
-  
+
   lcd.setCursor(0, 2);
   // Heure: heure:minute:seconde
   if (dateTimeSetSelection == 3) lcd.print(">");
@@ -361,9 +384,37 @@ void displaySetDateTimeMenu() {
   if (rtcSecond < 10) lcd.print("0");
   lcd.print(rtcSecond);
   if (dateTimeSetSelection == 5) lcd.print("<");
-  
+
   lcd.setCursor(0, 3);
   lcd.print(F("ENTER=OK RET=Ann"));
+}
+
+void displaySetOutputMenu() {
+  lcd.clear();
+  lcd.print(F("CHOIX SORTIES"));
+
+  const char* outputs[] = {
+    "Relais 1 PD6D12",
+    "Relais 2 PD7D6 ",
+    "Servo 1  PB5D9 ",
+    "Servo 2  PB6D10"
+  };
+
+  const byte outputBits[] = {OUTPUT_RELAY1_BIT, OUTPUT_RELAY2_BIT, OUTPUT_SERVO1_BIT, OUTPUT_SERVO2_BIT};
+
+  for (byte i = 0; i < 4; i++) {
+    lcd.setCursor(0, i);
+    // Afficher le curseur sur la ligne sélectionnée
+    if (outputSelection == i) lcd.print(">");
+    else lcd.print(" ");
+
+    // Afficher la case cochée ou non
+    if (selectedOutputs & outputBits[i]) lcd.print("\xA5"); // Caractère point (coché)
+    else lcd.print(" "); // Espace vide (non coché)
+
+    lcd.print(" ");
+    lcd.print(outputs[i]);
+  }
 }
 
 void displayTimerRunning() {
@@ -436,17 +487,25 @@ void displayAlarmWaiting() {
   printTime(now.hour(), now.minute(), now.second());
 }
 
-// === AFFICHAGE : MENU TEST RELAIS ===
-void displayRelayTestMenu() {
+// === AFFICHAGE : MENU TEST OUTPUT ===
+void displayOutputTestMenu() {
   lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("TEST RELAIS"));
-  lcd.setCursor(0, 1);
-  lcd.print(relayTestSelection == 0 ? F("> Relais 1  PD6 D12") : F("  Relais 1  PD6 D12"));
-  lcd.setCursor(0, 2);
-  lcd.print(relayTestSelection == 1 ? F("> Relais 2  PD7 D6 ") : F("  Relais 2  PD7 D6 "));
-  lcd.setCursor(0, 3);
-  lcd.print(F("ENTER=Act  RET=Menu"));
+  lcd.print(F("TEST OUTPUT"));
+
+  const char* outputs[] = {
+    "Relais 1 PD6D12",
+    "Relais 2 PD7D6 ",
+    "Servo 1  PB5D9 ",
+    "Servo 2  PB6D10"
+  };
+
+  for (byte i = 0; i < 4; i++) {
+    lcd.setCursor(0, i);
+    if (outputTestSelection == i) lcd.print(">");
+    else lcd.print(" ");
+    lcd.print(" ");
+    lcd.print(outputs[i]);
+  }
 }
 
 // === ACTIONS TIMER/ALARME ===
@@ -497,6 +556,72 @@ void stopAlarm() {
   state.alarmEnabled = false; state.alarmTriggered = false; state.alarmActive = false;
   state.alarmScreenInit = false; currentMenu = MENU_MAIN; state.mainMenuInit = false;
   smartPrintln(F("Alarme arrêtée"));
+}
+
+// === ACTIVATION DES SORTIES SÉLECTIONNÉES ===
+void activateOutput() {
+  // Activer Relais 1
+  if (selectedOutputs & OUTPUT_RELAY1_BIT) {
+    digitalWrite(RELAY1_PIN, HIGH);
+  }
+
+  // Activer Relais 2
+  if (selectedOutputs & OUTPUT_RELAY2_BIT) {
+    digitalWrite(RELAY2_PIN, HIGH);
+  }
+
+  // Activer Servo 1
+  if (selectedOutputs & OUTPUT_SERVO1_BIT) {
+    // Configuration PWM pour rotation continue (1.5ms = neutre, on sort de là pour tourner)
+    // Timer1, sortie A (OC1A = PB5 = D9)
+    // ICR1 = 40000 pour période 20ms (50Hz)
+    // OCR1A = 2400 pour ~1.2ms (rotation sens horaire)
+    TCCR1A = _BV(COM1A1) | _BV(WGM11);  // Non-inverting mode sur OC1A, Fast PWM avec ICR1
+    TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11); // Prescaler 8 (16MHz/8 = 2MHz = 0.5µs)
+    ICR1 = 40000;  // Période 20ms (40000 * 0.5µs = 20ms)
+    OCR1A = 2400;  // 1.2ms (2400 * 0.5µs = 1.2ms) - rotation
+  }
+
+  // Activer Servo 2
+  if (selectedOutputs & OUTPUT_SERVO2_BIT) {
+    // Timer1, sortie B (OC1B = PB6 = D10)
+    TCCR1A |= _BV(COM1B1);  // Ajouter le mode non-inverting sur OC1B
+    TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11); // Prescaler 8
+    ICR1 = 40000;  // Période 20ms
+    OCR1B = 2400;  // 1.2ms - rotation
+  }
+}
+
+void deactivateOutput() {
+  // Désactiver Relais 1
+  if (selectedOutputs & OUTPUT_RELAY1_BIT) {
+    digitalWrite(RELAY1_PIN, LOW);
+  }
+
+  // Désactiver Relais 2
+  if (selectedOutputs & OUTPUT_RELAY2_BIT) {
+    digitalWrite(RELAY2_PIN, LOW);
+  }
+
+  // Désactiver Servo 1
+  if (selectedOutputs & OUTPUT_SERVO1_BIT) {
+    // D'abord mettre à la position neutre (1.5ms)
+    OCR1A = 3000;  // 1.5ms (3000 * 0.5µs = 1.5ms) - neutre/arrêt
+    delay(100);  // Attendre que le servo se stabilise
+    // Puis désactiver complètement le PWM
+    TCCR1A &= ~_BV(COM1A1);  // Désactiver la sortie PWM sur OC1A
+    digitalWrite(SERVO1_PIN, LOW);  // Mettre la pin à LOW
+  }
+
+  // Désactiver Servo 2
+  if (selectedOutputs & OUTPUT_SERVO2_BIT) {
+    // D'abord mettre à la position neutre (1.5ms)
+    OCR1B = 3000;  // 1.5ms - neutre/arrêt
+    delay(100);  // Attendre que le servo se stabilise
+    // Puis désactiver complètement le PWM
+    TCCR1A &= ~_BV(COM1B1);  // Désactiver la sortie PWM sur OC1B
+    digitalWrite(SERVO2_PIN, LOW);  // Mettre la pin à LOW
+  }
 }
 
 // === NOUVELLE FONCTION DE VÉRIFICATION ALARME ===
@@ -569,21 +694,26 @@ void handleMainMenuButton(int buttonIndex) {
             currentMenu = MENU_SET_DATETIME; dateTimeSetSelection = 0; displaySetDateTimeMenu();
           }
           break;
-        case 4: // Backlight
+        case 4: // Sortie
+          outputSelection = 0;  // Commencer en haut de la liste
+          currentMenu = MENU_SET_OUTPUT;
+          displaySetOutputMenu();
+          break;
+        case 5: // Backlight
           state.lcdBacklightOn = !state.lcdBacklightOn;
           if (state.lcdBacklightOn) { state.lcdBacklightActive = true; lcd.backlight(); }
           else { state.lcdBacklightActive = false; lcd.noBacklight(); }
           lastButtonActivity = millis(); saveSettings(); state.mainMenuInit = false; displayMainMenu();
           break;
-        case 5: // Test Relais
-          currentMenu = MENU_TEST_RELAY;
-          relayTestSelection = 0;
-          displayRelayTestMenu();
+        case 6: // Test Output
+          currentMenu = MENU_TEST_OUTPUT;
+          outputTestSelection = 0;
+          displayOutputTestMenu();
           break;
       }
       break;
-    case 2: menuSelection = (menuSelection == 0) ? 5 : menuSelection - 1; state.mainMenuInit = false; displayMainMenu(); break;
-    case 4: menuSelection = (menuSelection == 5) ? 0 : menuSelection + 1; state.mainMenuInit = false; displayMainMenu(); break;
+    case 2: menuSelection = (menuSelection == 0) ? 6 : menuSelection - 1; state.mainMenuInit = false; displayMainMenu(); break;
+    case 4: menuSelection = (menuSelection == 6) ? 0 : menuSelection + 1; state.mainMenuInit = false; displayMainMenu(); break;
   }
 }
 
@@ -657,7 +787,7 @@ void handleSetAlarmButton(int buttonIndex) {
 
 void handleSetDateTimeButton(int buttonIndex) {
   activateBacklight();
-  
+
   switch (buttonIndex) {
     case 0: // ENTER
       rtc.adjust(DateTime(rtcYear, rtcMonth, rtcDay, rtcHour, rtcMinute, rtcSecond));
@@ -696,22 +826,82 @@ void handleSetDateTimeButton(int buttonIndex) {
   }
 }
 
-// === HANDLER : TEST RELAIS ===
-void handleRelayTestMenuButton(int buttonIndex) {
+void handleSetOutputButton(int buttonIndex) {
+  activateBacklight();
+
+  const byte outputBits[] = {OUTPUT_RELAY1_BIT, OUTPUT_RELAY2_BIT, OUTPUT_SERVO1_BIT, OUTPUT_SERVO2_BIT};
+
+  switch (buttonIndex) {
+    case 0: // ENTER - Toggle la sortie sélectionnée
+      selectedOutputs ^= outputBits[outputSelection]; // XOR pour inverser le bit
+      displaySetOutputMenu();
+      break;
+    case 1: // RETURN - Sauvegarder et retourner
+      saveSettings();
+      currentMenu = MENU_MAIN;
+      state.mainMenuInit = false;
+      lcd.clear();
+      displayMainMenu();
+      break;
+    case 2: // UP
+      outputSelection = (outputSelection == 0) ? 3 : outputSelection - 1;
+      displaySetOutputMenu();
+      break;
+    case 4: // DOWN
+      outputSelection = (outputSelection == 3) ? 0 : outputSelection + 1;
+      displaySetOutputMenu();
+      break;
+  }
+}
+
+// === HANDLER : TEST OUTPUT ===
+void handleOutputTestMenuButton(int buttonIndex) {
   activateBacklight();
 
   switch (buttonIndex) {
-    case 0: // ENTER -> activer le relais sélectionné 1s
-      if (relayTestSelection == 0) { // Relais 1 (PD6/D12)
-        digitalWrite(RELAY1_PIN, HIGH);
-        delay(1000);
-        digitalWrite(RELAY1_PIN, LOW);
-      } else { // Relais 2 (PD7/D6)
-        digitalWrite(RELAY2_PIN, HIGH);
-        delay(1000);
-        digitalWrite(RELAY2_PIN, LOW);
+    case 0: // ENTER -> activer la sortie sélectionnée
+      switch (outputTestSelection) {
+        case 0: // Relais 1 (PD6/D12)
+          digitalWrite(RELAY1_PIN, HIGH);
+          delay(1000);
+          digitalWrite(RELAY1_PIN, LOW);
+          break;
+
+        case 1: // Relais 2 (PD7/D6)
+          digitalWrite(RELAY2_PIN, HIGH);
+          delay(1000);
+          digitalWrite(RELAY2_PIN, LOW);
+          break;
+
+        case 2: // Servo 1 (PB5/D9)
+          // Configurer PWM pour rotation
+          TCCR1A = _BV(COM1A1) | _BV(WGM11);
+          TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11);
+          ICR1 = 40000;
+          OCR1A = 2400;  // 1.2ms - rotation
+          delay(1000);
+          // Arrêter le servo
+          OCR1A = 3000;  // 1.5ms - neutre
+          delay(100);
+          TCCR1A &= ~_BV(COM1A1);
+          digitalWrite(SERVO1_PIN, LOW);
+          break;
+
+        case 3: // Servo 2 (PB6/D10)
+          // Configurer PWM pour rotation
+          TCCR1A = _BV(COM1B1) | _BV(WGM11);
+          TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11);
+          ICR1 = 40000;
+          OCR1B = 2400;  // 1.2ms - rotation
+          delay(1000);
+          // Arrêter le servo
+          OCR1B = 3000;  // 1.5ms - neutre
+          delay(100);
+          TCCR1A &= ~_BV(COM1B1);
+          digitalWrite(SERVO2_PIN, LOW);
+          break;
       }
-      displayRelayTestMenu();
+      displayOutputTestMenu();
       break;
 
     case 1: // RETURN -> retour au menu principal
@@ -721,14 +911,14 @@ void handleRelayTestMenuButton(int buttonIndex) {
       displayMainMenu();
       break;
 
-    case 2: // UP -> changer de relais
-      relayTestSelection = (relayTestSelection == 0) ? 1 : 0;
-      displayRelayTestMenu();
+    case 2: // UP -> changer de sortie
+      outputTestSelection = (outputTestSelection == 0) ? 3 : outputTestSelection - 1;
+      displayOutputTestMenu();
       break;
 
-    case 4: // DOWN -> changer de relais
-      relayTestSelection = (relayTestSelection == 0) ? 1 : 0;
-      displayRelayTestMenu();
+    case 4: // DOWN -> changer de sortie
+      outputTestSelection = (outputTestSelection == 3) ? 0 : outputTestSelection + 1;
+      displayOutputTestMenu();
       break;
 
     // LEFT/RIGHT ignorés pour ce menu
@@ -745,6 +935,10 @@ void setup() {
   pinMode(RELAY2_PIN, OUTPUT);
   digitalWrite(RELAY1_PIN, LOW);
   digitalWrite(RELAY2_PIN, LOW);
+
+  // Servos (PWM)
+  pinMode(SERVO1_PIN, OUTPUT);
+  pinMode(SERVO2_PIN, OUTPUT);
 
   Serial.begin(9600);
   smartPrintln(F("=== Smart Timer v0.1 ==="));
@@ -774,13 +968,22 @@ void loop() {
   unsigned long currentMillis = millis();
   updateBacklight();
   
-  // RELAIS 1
+  // Gestion de la sortie sélectionnée (relais ou servo)
   if (state.alarmActive) {
-    digitalWrite(RELAY1_PIN, HIGH);
-    if (currentMillis - alarmStartTime >= ALARM_DURATION) {
-      state.alarmActive = false; digitalWrite(RELAY1_PIN, LOW); smartPrintln(F("Signal Relais 1 terminé"));
+    activateOutput();
+    // Pour les servos, utiliser SERVO_DURATION, pour les relais ALARM_DURATION
+    unsigned int duration = (selectedOutputs & OUTPUT_SERVO1_BIT || selectedOutputs & OUTPUT_SERVO2_BIT) ? SERVO_DURATION : ALARM_DURATION;
+    if (currentMillis - alarmStartTime >= duration) {
+      state.alarmActive = false;
+      deactivateOutput();
+      smartPrintln(F("Signal sortie terminé"));
     }
-  } else digitalWrite(RELAY1_PIN, LOW);
+  } else {
+    // S'assurer que les relais sont OFF quand pas actifs
+    if (selectedOutputs & OUTPUT_RELAY1_BIT || selectedOutputs & OUTPUT_RELAY2_BIT) {
+      deactivateOutput();
+    }
+  }
   
   // *** MODIFICATION PRINCIPALE : Synchroniser alarme avec affichage ***
   if (currentMillis - previousClockMillis >= CLOCK_UPDATE_INTERVAL) {
@@ -841,11 +1044,12 @@ void loop() {
             case MENU_SET_TIME: handleSetTimeButton(i); break;
             case MENU_SET_ALARM: handleSetAlarmButton(i); break;
             case MENU_SET_DATETIME: handleSetDateTimeButton(i); break;
-            case MENU_TEST_RELAY: handleRelayTestMenuButton(i); break;
+            case MENU_SET_OUTPUT: handleSetOutputButton(i); break;
+            case MENU_TEST_OUTPUT: handleOutputTestMenuButton(i); break;
             case TIMER_RUNNING: if (i == 1) { stopTimer(); displayMainMenu(); } break;
             case TIMER_FINISHED:
               if (i == 1) {
-                state.alarmActive = false; digitalWrite(RELAY1_PIN, LOW); state.timerFinished = false;
+                state.alarmActive = false; deactivateOutput(); state.timerFinished = false;
                 state.timerScreenInit = false; currentMenu = MENU_MAIN; state.mainMenuInit = false; displayMainMenu();
               }
               break;
