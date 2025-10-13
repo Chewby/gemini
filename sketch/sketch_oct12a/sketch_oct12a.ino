@@ -2,8 +2,10 @@
 #include <LCD_I2C.h>
 #include <EEPROM.h>
 #include <Mouse.h>
+#include <RTClib.h>
 
 LCD_I2C lcd(0x27, 16, 4);
+RTC_DS3231 rtc;
 
 // === CONFIGURATION ===
 const byte LED_PIN = 8;
@@ -15,8 +17,8 @@ const byte RELAY1_PIN = 12; // PD6
 const byte RELAY2_PIN = 6;  // PD7
 
 // Variables temporelles
-unsigned long lastButtonActivity, lastDebounceTime[6], lastMouseMove, previousUpdateMillis;
-const unsigned int BACKLIGHT_TIMEOUT = 30000, DEBOUNCE_DELAY = 50, UPDATE_INTERVAL = 100;
+unsigned long lastButtonActivity, lastDebounceTime[6], lastMouseMove, previousUpdateMillis, previousClockMillis;
+const unsigned int BACKLIGHT_TIMEOUT = 30000, DEBOUNCE_DELAY = 50, UPDATE_INTERVAL = 100, CLOCK_UPDATE_INTERVAL = 1000;
 
 // Variables d'état
 struct {
@@ -47,20 +49,25 @@ enum MouseMode : byte {
 };
 
 // États du menu
-enum MenuState : byte { 
+enum MenuState : byte {
   MENU_MAIN,        // Menu principal
   MENU_CONFIG,      // Configuration
   MOUSE_RUNNING,    // Simulation active
-  MENU_TEST_RELAY   // <-- NOUVEAU : Test relais (dernier dans le menu)
+  MENU_TEST_RELAY,  // Test relais
+  MENU_SET_DATETIME // Réglage date/heure
 };
 
 MouseMode currentMouseMode = MODE_RANDOM;
 MenuState currentMenu = MENU_MAIN;
 byte menuSelection = 0;
 byte configSelection = 0;
+byte dateTimeSetSelection = 0;
 
 // Sélection pour le mode test relais
 byte relayTestSelection = 0; // 0 = RELAY1 (PD6/D12), 1 = RELAY2 (PD7/D6)
+
+// Variables RTC pour réglage
+int rtcYear = 2025, rtcMonth = 10, rtcDay = 13, rtcHour = 12, rtcMinute = 0, rtcSecond = 0;
 
 // Paramètres de simulation
 int mouseSpeed = 5;          // Vitesse de mouvement (1-10)
@@ -177,32 +184,56 @@ void saveSettings() {
 }
 
 // === AFFICHAGE ===
+void printTime(int h, int m, int s = -1) {
+  if (h < 10) lcd.print("0"); lcd.print(h); lcd.print(":");
+  if (m < 10) lcd.print("0"); lcd.print(m);
+  if (s >= 0) { lcd.print(":"); if (s < 10) lcd.print("0"); lcd.print(s); }
+}
+
+void printDate(int d, int m, int y = -1, bool shortYear = false) {
+  if (d < 10) lcd.print("0"); lcd.print(d); lcd.print("/");
+  if (m < 10) lcd.print("0"); lcd.print(m);
+  if (y >= 0) {
+    lcd.print("/");
+    if (shortYear) {
+      int shortY = y % 100;
+      if (shortY < 10) lcd.print("0");
+      lcd.print(shortY);
+    } else {
+      lcd.print(y);
+    }
+  }
+}
+
 void displayMainMenu() {
+  DateTime now = rtc.now();
+
   if (!state.mainMenuInit) {
     lcd.clear();
-    
-    // Menu à 5 options (ajout "Test Relais" en dernière position)
+
+    // Menu à 6 options (ajout "Régler Heure")
     const char* items[] = {
       "Mode: ",
-      "Configuration", 
+      "Configuration",
       "Demarrer Simu",
+      "Regler Heure",
       "Retro: ",
       "Test Relais"
     };
-    
+
     // Affiche 3 lignes autour de la sélection
-    byte start = constrain(menuSelection - 1, 0, 2); // <- ajusté pour 5 éléments
+    byte start = constrain(menuSelection - 1, 0, 3);
     for (byte i = 0; i < 3; i++) {
       byte idx = start + i;
-      if (idx < 5) { // <- ajusté (était 4)
+      if (idx < 6) {
         lcd.setCursor(0, i + 1);
         lcd.print(menuSelection == idx ? "> " : "  ");
         lcd.print(items[idx]);
-        
+
         if (idx == 0) {
           const char* modes[] = {"Random", "Jiggle", "Circular"};
           lcd.print(modes[currentMouseMode]);
-        } else if (idx == 3) {
+        } else if (idx == 4) {
           lcd.print(state.lcdBacklightOn ? "ON" : "OFF");
           if (state.lcdBacklightOn && !state.lcdBacklightActive) lcd.print("*");
         }
@@ -210,14 +241,14 @@ void displayMainMenu() {
     }
     state.mainMenuInit = true;
   }
-  
-  // Titre avec état
+
+  // Affichage de l'heure en temps réel
   lcd.setCursor(0, 0);
-  lcd.print("MOUSE SIMULATOR ");
-  if (state.mouseActive) {
-    lcd.setCursor(15, 0);
-    lcd.print("*");
-  }
+  lcd.print("                "); // Effacer la ligne
+  lcd.setCursor(0, 0);
+  printDate(now.day(), now.month(), now.year(), true);
+  lcd.print(" ");
+  printTime(now.hour(), now.minute(), now.second());
 }
 
 void displayConfigMenu() {
@@ -269,7 +300,49 @@ void displayMouseRunning() {
   lcd.print("RETURN = Arreter");
 }
 
-// === AFFICHAGE : MENU TEST RELAIS (NOUVEAU) ===
+// === AFFICHAGE : MENU REGLAGE DATE/HEURE ===
+void displaySetDateTimeMenu() {
+  lcd.clear();
+  lcd.print(F("REGLAGE HEURE"));
+
+  lcd.setCursor(0, 1);
+  // Date: jour/mois/année
+  if (dateTimeSetSelection == 0) lcd.print(">");
+  if (rtcDay < 10) lcd.print("0");
+  lcd.print(rtcDay);
+  if (dateTimeSetSelection == 0) lcd.print("<");
+  lcd.print("/");
+  if (dateTimeSetSelection == 1) lcd.print(">");
+  if (rtcMonth < 10) lcd.print("0");
+  lcd.print(rtcMonth);
+  if (dateTimeSetSelection == 1) lcd.print("<");
+  lcd.print("/");
+  if (dateTimeSetSelection == 2) lcd.print(">");
+  lcd.print(rtcYear);
+  if (dateTimeSetSelection == 2) lcd.print("<");
+
+  lcd.setCursor(0, 2);
+  // Heure: heure:minute:seconde
+  if (dateTimeSetSelection == 3) lcd.print(">");
+  if (rtcHour < 10) lcd.print("0");
+  lcd.print(rtcHour);
+  if (dateTimeSetSelection == 3) lcd.print("<");
+  lcd.print(":");
+  if (dateTimeSetSelection == 4) lcd.print(">");
+  if (rtcMinute < 10) lcd.print("0");
+  lcd.print(rtcMinute);
+  if (dateTimeSetSelection == 4) lcd.print("<");
+  lcd.print(":");
+  if (dateTimeSetSelection == 5) lcd.print(">");
+  if (rtcSecond < 10) lcd.print("0");
+  lcd.print(rtcSecond);
+  if (dateTimeSetSelection == 5) lcd.print("<");
+
+  lcd.setCursor(0, 3);
+  lcd.print(F("ENTER=OK RET=Ann"));
+}
+
+// === AFFICHAGE : MENU TEST RELAIS ===
 void displayRelayTestMenu() {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -390,34 +463,48 @@ void handleMainMenuButton(int buttonIndex) {
       switch (menuSelection) {
         case 0: // Mode
           currentMouseMode = (MouseMode)((currentMouseMode + 1) % 3);
-          saveSettings(); 
-          state.mainMenuInit = false; 
+          saveSettings();
+          state.mainMenuInit = false;
           displayMainMenu();
           break;
         case 1: // Configuration
-          currentMenu = MENU_CONFIG; 
-          configSelection = 0; 
+          currentMenu = MENU_CONFIG;
+          configSelection = 0;
           state.configMenuInit = false;
           displayConfigMenu();
           break;
         case 2: // Démarrer
           startMouseSimulation();
           break;
-        case 3: // Backlight
-          state.lcdBacklightOn = !state.lcdBacklightOn;
-          if (state.lcdBacklightOn) { 
-            state.lcdBacklightActive = true; 
-            lcd.backlight(); 
-          } else { 
-            state.lcdBacklightActive = false; 
-            lcd.noBacklight(); 
+        case 3: // Régler Heure
+          {
+            DateTime now = rtc.now();
+            rtcYear = now.year();
+            rtcMonth = now.month();
+            rtcDay = now.day();
+            rtcHour = now.hour();
+            rtcMinute = now.minute();
+            rtcSecond = now.second();
+            currentMenu = MENU_SET_DATETIME;
+            dateTimeSetSelection = 0;
+            displaySetDateTimeMenu();
           }
-          lastButtonActivity = millis(); 
-          saveSettings(); 
-          state.mainMenuInit = false; 
+          break;
+        case 4: // Backlight
+          state.lcdBacklightOn = !state.lcdBacklightOn;
+          if (state.lcdBacklightOn) {
+            state.lcdBacklightActive = true;
+            lcd.backlight();
+          } else {
+            state.lcdBacklightActive = false;
+            lcd.noBacklight();
+          }
+          lastButtonActivity = millis();
+          saveSettings();
+          state.mainMenuInit = false;
           displayMainMenu();
           break;
-        case 4: // <-- Nouveau : Test Relais (dernier item)
+        case 5: // Test Relais
           currentMenu = MENU_TEST_RELAY;
           relayTestSelection = 0;
           displayRelayTestMenu();
@@ -425,14 +512,14 @@ void handleMainMenuButton(int buttonIndex) {
       }
       break;
     case 2: // UP
-      menuSelection = (menuSelection == 0) ? 4 : menuSelection - 1; // <-- ajusté (max = 4)
-      state.mainMenuInit = false; 
-      displayMainMenu(); 
+      menuSelection = (menuSelection == 0) ? 5 : menuSelection - 1; // <-- ajusté (max = 5)
+      state.mainMenuInit = false;
+      displayMainMenu();
       break;
     case 4: // DOWN
-      menuSelection = (menuSelection == 4) ? 0 : menuSelection + 1; // <-- ajusté (max = 4)
-      state.mainMenuInit = false; 
-      displayMainMenu(); 
+      menuSelection = (menuSelection == 5) ? 0 : menuSelection + 1; // <-- ajusté (max = 5)
+      state.mainMenuInit = false;
+      displayMainMenu();
       break;
   }
 }
@@ -521,6 +608,58 @@ void handleRelayTestMenuButton(int buttonIndex) {
   }
 }
 
+// === HANDLER : REGLAGE DATE/HEURE ===
+void handleSetDateTimeButton(int buttonIndex) {
+  activateBacklight();
+
+  switch (buttonIndex) {
+    case 0: // ENTER
+      rtc.adjust(DateTime(rtcYear, rtcMonth, rtcDay, rtcHour, rtcMinute, rtcSecond));
+      smartPrintln(F("RTC mis à jour !"));
+      currentMenu = MENU_MAIN;
+      state.mainMenuInit = false;
+      lcd.clear();
+      displayMainMenu();
+      break;
+    case 1: // RETURN
+      currentMenu = MENU_MAIN;
+      state.mainMenuInit = false;
+      lcd.clear();
+      displayMainMenu();
+      break;
+    case 2: // UP
+      switch (dateTimeSetSelection) {
+        case 0: rtcDay = (rtcDay >= 31) ? 1 : rtcDay + 1; break;
+        case 1: rtcMonth = (rtcMonth >= 12) ? 1 : rtcMonth + 1; break;
+        case 2: rtcYear = (rtcYear >= 2030) ? 2025 : rtcYear + 1; break;
+        case 3: rtcHour = (rtcHour >= 23) ? 0 : rtcHour + 1; break;
+        case 4: rtcMinute = (rtcMinute >= 59) ? 0 : rtcMinute + 1; break;
+        case 5: rtcSecond = (rtcSecond >= 59) ? 0 : rtcSecond + 1; break;
+      }
+      displaySetDateTimeMenu();
+      break;
+    case 3: // RIGHT
+      dateTimeSetSelection = (dateTimeSetSelection >= 5) ? 0 : dateTimeSetSelection + 1;
+      displaySetDateTimeMenu();
+      break;
+    case 4: // DOWN
+      switch (dateTimeSetSelection) {
+        case 0: rtcDay = (rtcDay <= 1) ? 31 : rtcDay - 1; break;
+        case 1: rtcMonth = (rtcMonth <= 1) ? 12 : rtcMonth - 1; break;
+        case 2: rtcYear = (rtcYear <= 2025) ? 2030 : rtcYear - 1; break;
+        case 3: rtcHour = (rtcHour <= 0) ? 23 : rtcHour - 1; break;
+        case 4: rtcMinute = (rtcMinute <= 0) ? 59 : rtcMinute - 1; break;
+        case 5: rtcSecond = (rtcSecond <= 0) ? 59 : rtcSecond - 1; break;
+      }
+      displaySetDateTimeMenu();
+      break;
+    case 5: // LEFT
+      dateTimeSetSelection = (dateTimeSetSelection <= 0) ? 5 : dateTimeSetSelection - 1;
+      displaySetDateTimeMenu();
+      break;
+  }
+}
+
 // === SETUP ET LOOP ===
 void setup() {
   pinMode(LED_PIN, OUTPUT);
@@ -531,79 +670,106 @@ void setup() {
   pinMode(RELAY2_PIN, OUTPUT);
   digitalWrite(RELAY1_PIN, LOW);
   digitalWrite(RELAY2_PIN, LOW);
-  
+
   Serial.begin(9600);
   smartPrintln(F("=== Mouse Simulator v1.0 ==="));
-  
-  lcd.begin(); 
+
+  lcd.begin();
   loadSettings();
-  
-  lcd.clear(); 
-  lcd.setCursor(0, 1); 
+
+  lcd.clear();
+  lcd.setCursor(0, 1);
   lcd.print(F("MOUSE SIMULATOR"));
-  lcd.setCursor(0, 2); 
-  lcd.print(F("Ver.1.0 par Chewby")); 
+  lcd.setCursor(0, 2);
+  lcd.print(F("Ver.1.0 par Chewby"));
   delay(2000);
-  
+
+  // Initialisation du RTC DS3231
+  if (!rtc.begin()) {
+    smartPrintln(F("Erreur : DS3231 introuvable !"));
+    lcd.clear();
+    lcd.print(F("ERREUR RTC"));
+    delay(2000);
+  } else {
+    if (rtc.lostPower()) {
+      smartPrintln(F("RTC perdue - mise à l'heure !"));
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    smartPrintln(F("RTC initialisé !"));
+  }
+
   displayMainMenu();
-  
+
   smartPrintln(F("Système initialisé !"));
   smartPrintln(F("ATTENTION: Ce programme contrôle la souris !"));
 }
 
 void loop() {
   // Gestion du buffer série
-  if (Serial && !state.serialWasConnected) { 
-    state.serialWasConnected = true; 
-    flushBuffer(); 
+  if (Serial && !state.serialWasConnected) {
+    state.serialWasConnected = true;
+    flushBuffer();
   } else if (!Serial && state.serialWasConnected) {
     state.serialWasConnected = false;
   }
-  
+
   unsigned long currentMillis = millis();
   updateBacklight();
-  
+
   // Simulation de la souris
   if (state.mouseActive) {
     performMouseMovement();
   } else {
     digitalWrite(LED_PIN, LOW); // LED éteinte si pas actif
   }
-  
+
+  // Mise à jour de l'horloge toutes les secondes
+  if (currentMillis - previousClockMillis >= CLOCK_UPDATE_INTERVAL) {
+    previousClockMillis = currentMillis;
+
+    // Rafraîchir l'affichage de l'heure dans le menu principal
+    if (currentMenu == MENU_MAIN) {
+      displayMainMenu();
+    }
+  }
+
   // Mise à jour de l'affichage
   if (currentMillis - previousUpdateMillis >= UPDATE_INTERVAL) {
     previousUpdateMillis = currentMillis;
-    
+
     if (currentMenu == MOUSE_RUNNING && state.mouseActive) {
       displayMouseRunning();
     }
   }
-  
+
   // Gestion des boutons
   for (byte i = 0; i < 6; i++) {
     int reading = digitalRead(BUTTON_PINS[i]);
     if (reading != state.lastButtonState[i]) lastDebounceTime[i] = currentMillis;
-    
+
     if (currentMillis - lastDebounceTime[i] > DEBOUNCE_DELAY) {
       if (reading != state.currentButtonState[i]) {
         state.currentButtonState[i] = reading;
         if (reading == LOW) {
           activateBacklight();
-          
+
           switch (currentMenu) {
-            case MENU_MAIN: 
-              handleMainMenuButton(i); 
+            case MENU_MAIN:
+              handleMainMenuButton(i);
               break;
-            case MENU_CONFIG: 
-              handleConfigMenuButton(i); 
+            case MENU_CONFIG:
+              handleConfigMenuButton(i);
               break;
-            case MOUSE_RUNNING: 
+            case MOUSE_RUNNING:
               if (i == 1) { // RETURN
-                stopMouseSimulation(); 
-              } 
+                stopMouseSimulation();
+              }
               break;
-            case MENU_TEST_RELAY: // <-- NOUVEAU
+            case MENU_TEST_RELAY:
               handleRelayTestMenuButton(i);
+              break;
+            case MENU_SET_DATETIME:
+              handleSetDateTimeButton(i);
               break;
           }
         }
