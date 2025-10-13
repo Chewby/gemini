@@ -10,6 +10,11 @@ RTC_DS3231 rtc;
 const byte LED_PIN = 8;
 const byte BUTTON_PINS[] = {A5, A4, A3, A2, A1, A0};
 
+// === PINS RELAIS (ATmega32U4) ===
+// PD6 = Arduino D12  |  PD7 = Arduino D6
+const byte RELAY1_PIN = 12; // PD6
+const byte RELAY2_PIN = 6;  // PD7
+
 // Variables temporelles
 unsigned long alarmStartTime, lastButtonActivity, lastDebounceTime[6], previousClockMillis;
 const unsigned int BACKLIGHT_TIMEOUT = 30000, DEBOUNCE_DELAY = 50, CLOCK_UPDATE_INTERVAL = 1000, ALARM_DURATION = 1000;
@@ -38,7 +43,7 @@ enum { EEPROM_MINUTES = 0, EEPROM_SECONDS = 4, EEPROM_MODE = 8, EEPROM_ALARM_YEA
 
 // Modes et menu
 enum TimerMode : byte { MODE_SIMPLE, MODE_REPEAT, MODE_ALARM, MODE_ALARM_DAILY };
-enum MenuState : byte { MENU_MAIN, MENU_SET_TIME, MENU_SET_ALARM, MENU_SET_DATETIME, TIMER_RUNNING, TIMER_FINISHED, ALARM_WAITING };
+enum MenuState : byte { MENU_MAIN, MENU_SET_TIME, MENU_SET_ALARM, MENU_SET_DATETIME, TIMER_RUNNING, TIMER_FINISHED, ALARM_WAITING, MENU_TEST_RELAY };
 
 TimerMode currentTimerMode = MODE_SIMPLE;
 MenuState currentMenu = MENU_MAIN;
@@ -47,6 +52,9 @@ byte timeSetSelection = 0;
 byte alarmSetSelection = 0;
 byte dateTimeSetSelection = 0;
 byte cycleCount = 0;
+
+// Sélection pour le mode test relais
+byte relayTestSelection = 0; // 0 = RELAY1 (PD6/D12), 1 = RELAY2 (PD7/D6)
 
 // Variables timer/alarme
 int timerMinutes = 5, timerSeconds = 0;
@@ -199,22 +207,22 @@ void displayMainMenu() {
   
   if (!state.mainMenuInit) {
     lcd.clear();
-    
-    // Menu à 5 options avec navigation
-    const char* items[] = {"Mode: ", 
+
+    // Menu à 6 options avec navigation
+    const char* items[] = {"Mode: ",
                           (currentTimerMode == MODE_ALARM || currentTimerMode == MODE_ALARM_DAILY) ? "Regler Alarme" : "Regler Temps",
-                          (currentTimerMode == MODE_ALARM || currentTimerMode == MODE_ALARM_DAILY) ? 
+                          (currentTimerMode == MODE_ALARM || currentTimerMode == MODE_ALARM_DAILY) ?
                             (currentTimerMode == MODE_ALARM ? "Start Alarme" : "Start Daily") : "Start",
-                          "Regler Heure", "Retro: "};
-    
-    byte start = constrain(menuSelection - 1, 0, 2);
+                          "Regler Heure", "Retro: ", "Test Relais"};
+
+    byte start = constrain(menuSelection - 1, 0, 3);
     for (byte i = 0; i < 3; i++) {
       byte idx = start + i;
-      if (idx < 5) {
+      if (idx < 6) {
         lcd.setCursor(0, i + 1);
         lcd.print(menuSelection == idx ? "> " : "  ");
         lcd.print(items[idx]);
-        
+
         if (idx == 0) {
           const char* modes[] = {"Simple", "Repeat", "Alarme", "Daily"};
           lcd.print(modes[currentTimerMode]);
@@ -393,7 +401,7 @@ void displayTimerRunning() {
 void displayTimerFinished() {
   lcd.clear(); lcd.print(F("*** FINI ***"));
   lcd.setCursor(0, 1); lcd.print(F("Timer termine"));
-  lcd.setCursor(0, 2); lcd.print(F("LED allumee 1 sec"));
+  lcd.setCursor(0, 2); lcd.print(F("Relais 1 active"));
   lcd.setCursor(0, 3); lcd.print(F("RETURN = Retour"));
 }
 
@@ -426,6 +434,19 @@ void displayAlarmWaiting() {
     lcd.print(" ");
   }
   printTime(now.hour(), now.minute(), now.second());
+}
+
+// === AFFICHAGE : MENU TEST RELAIS ===
+void displayRelayTestMenu() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("TEST RELAIS"));
+  lcd.setCursor(0, 1);
+  lcd.print(relayTestSelection == 0 ? F("> Relais 1  PD6 D12") : F("  Relais 1  PD6 D12"));
+  lcd.setCursor(0, 2);
+  lcd.print(relayTestSelection == 1 ? F("> Relais 2  PD7 D6 ") : F("  Relais 2  PD7 D6 "));
+  lcd.setCursor(0, 3);
+  lcd.print(F("ENTER=Act  RET=Menu"));
 }
 
 // === ACTIONS TIMER/ALARME ===
@@ -514,7 +535,7 @@ void checkAlarmTrigger() {
       // Alarme unique - afficher écran alarme
       state.alarmScreenInit = false;
       lcd.clear(); lcd.print(F("*** ALARME ! ***"));
-      lcd.setCursor(0, 1); lcd.print(F("LED allumee 1 sec"));
+      lcd.setCursor(0, 1); lcd.print(F("Relais 1 active"));
       lcd.setCursor(0, 3); lcd.print(F("RETURN = Arreter"));
     } else {
       // Alarme daily - marquer comme déclenchée aujourd'hui
@@ -554,10 +575,15 @@ void handleMainMenuButton(int buttonIndex) {
           else { state.lcdBacklightActive = false; lcd.noBacklight(); }
           lastButtonActivity = millis(); saveSettings(); state.mainMenuInit = false; displayMainMenu();
           break;
+        case 5: // Test Relais
+          currentMenu = MENU_TEST_RELAY;
+          relayTestSelection = 0;
+          displayRelayTestMenu();
+          break;
       }
       break;
-    case 2: menuSelection = (menuSelection == 0) ? 4 : menuSelection - 1; state.mainMenuInit = false; displayMainMenu(); break;
-    case 4: menuSelection = (menuSelection == 4) ? 0 : menuSelection + 1; state.mainMenuInit = false; displayMainMenu(); break;
+    case 2: menuSelection = (menuSelection == 0) ? 5 : menuSelection - 1; state.mainMenuInit = false; displayMainMenu(); break;
+    case 4: menuSelection = (menuSelection == 5) ? 0 : menuSelection + 1; state.mainMenuInit = false; displayMainMenu(); break;
   }
 }
 
@@ -670,11 +696,56 @@ void handleSetDateTimeButton(int buttonIndex) {
   }
 }
 
+// === HANDLER : TEST RELAIS ===
+void handleRelayTestMenuButton(int buttonIndex) {
+  activateBacklight();
+
+  switch (buttonIndex) {
+    case 0: // ENTER -> activer le relais sélectionné 1s
+      if (relayTestSelection == 0) { // Relais 1 (PD6/D12)
+        digitalWrite(RELAY1_PIN, HIGH);
+        delay(1000);
+        digitalWrite(RELAY1_PIN, LOW);
+      } else { // Relais 2 (PD7/D6)
+        digitalWrite(RELAY2_PIN, HIGH);
+        delay(1000);
+        digitalWrite(RELAY2_PIN, LOW);
+      }
+      displayRelayTestMenu();
+      break;
+
+    case 1: // RETURN -> retour au menu principal
+      currentMenu = MENU_MAIN;
+      state.mainMenuInit = false;
+      lcd.clear();
+      displayMainMenu();
+      break;
+
+    case 2: // UP -> changer de relais
+      relayTestSelection = (relayTestSelection == 0) ? 1 : 0;
+      displayRelayTestMenu();
+      break;
+
+    case 4: // DOWN -> changer de relais
+      relayTestSelection = (relayTestSelection == 0) ? 1 : 0;
+      displayRelayTestMenu();
+      break;
+
+    // LEFT/RIGHT ignorés pour ce menu
+  }
+}
+
 // === SETUP ET LOOP ===
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   for (byte i = 0; i < 6; i++) pinMode(BUTTON_PINS[i], INPUT_PULLUP);
-  
+
+  // Relais
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  digitalWrite(RELAY1_PIN, LOW);
+  digitalWrite(RELAY2_PIN, LOW);
+
   Serial.begin(9600);
   smartPrintln(F("=== Smart Timer v0.1 ==="));
   lcd.begin(); loadSettings();
@@ -703,13 +774,13 @@ void loop() {
   unsigned long currentMillis = millis();
   updateBacklight();
   
-  // LED
+  // RELAIS 1
   if (state.alarmActive) {
-    digitalWrite(LED_PIN, HIGH);
+    digitalWrite(RELAY1_PIN, HIGH);
     if (currentMillis - alarmStartTime >= ALARM_DURATION) {
-      state.alarmActive = false; digitalWrite(LED_PIN, LOW); smartPrintln(F("Signal LED terminé"));
+      state.alarmActive = false; digitalWrite(RELAY1_PIN, LOW); smartPrintln(F("Signal Relais 1 terminé"));
     }
-  } else digitalWrite(LED_PIN, LOW);
+  } else digitalWrite(RELAY1_PIN, LOW);
   
   // *** MODIFICATION PRINCIPALE : Synchroniser alarme avec affichage ***
   if (currentMillis - previousClockMillis >= CLOCK_UPDATE_INTERVAL) {
@@ -770,12 +841,13 @@ void loop() {
             case MENU_SET_TIME: handleSetTimeButton(i); break;
             case MENU_SET_ALARM: handleSetAlarmButton(i); break;
             case MENU_SET_DATETIME: handleSetDateTimeButton(i); break;
+            case MENU_TEST_RELAY: handleRelayTestMenuButton(i); break;
             case TIMER_RUNNING: if (i == 1) { stopTimer(); displayMainMenu(); } break;
-            case TIMER_FINISHED: 
-              if (i == 1) { 
-                state.alarmActive = false; digitalWrite(LED_PIN, LOW); state.timerFinished = false; 
-                state.timerScreenInit = false; currentMenu = MENU_MAIN; state.mainMenuInit = false; displayMainMenu(); 
-              } 
+            case TIMER_FINISHED:
+              if (i == 1) {
+                state.alarmActive = false; digitalWrite(RELAY1_PIN, LOW); state.timerFinished = false;
+                state.timerScreenInit = false; currentMenu = MENU_MAIN; state.mainMenuInit = false; displayMainMenu();
+              }
               break;
             case ALARM_WAITING: if (i == 1) { stopAlarm(); displayMainMenu(); } break;
           }
