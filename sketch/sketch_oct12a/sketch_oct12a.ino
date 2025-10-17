@@ -16,6 +16,11 @@ const byte BUTTON_PINS[] = {A5, A4, A3, A2, A1, A0};
 const byte RELAY1_PIN = 12; // PD6
 const byte RELAY2_PIN = 6;  // PD7
 
+// === PINS SERVOS (PWM) ===
+// PB5 = Arduino D9 (OC1A)  |  PB6 = Arduino D10 (OC1B)
+const byte SERVO1_PIN = 9;  // PB5
+const byte SERVO2_PIN = 10; // PB6
+
 // Variables temporelles
 unsigned long lastButtonActivity, lastDebounceTime[6], lastMouseMove, previousUpdateMillis, previousClockMillis;
 const unsigned int BACKLIGHT_TIMEOUT = 30000, DEBOUNCE_DELAY = 50, UPDATE_INTERVAL = 100, CLOCK_UPDATE_INTERVAL = 1000;
@@ -53,7 +58,7 @@ enum MenuState : byte {
   MENU_MAIN,        // Menu principal
   MENU_CONFIG,      // Configuration
   MOUSE_RUNNING,    // Simulation active
-  MENU_TEST_RELAY,  // Test relais
+  MENU_TEST_OUTPUT, // Test sorties (relais + servos)
   MENU_SET_DATETIME // Réglage date/heure
 };
 
@@ -63,8 +68,8 @@ byte menuSelection = 0;
 byte configSelection = 0;
 byte dateTimeSetSelection = 0;
 
-// Sélection pour le mode test relais
-byte relayTestSelection = 0; // 0 = RELAY1 (PD6/D12), 1 = RELAY2 (PD7/D6)
+// Sélection pour le mode test output
+byte outputTestSelection = 0; // 0 = RELAY1, 1 = RELAY2, 2 = SERVO1, 3 = SERVO2
 
 // Variables RTC pour réglage
 int rtcYear = 2025, rtcMonth = 10, rtcDay = 13, rtcHour = 12, rtcMinute = 0, rtcSecond = 0;
@@ -218,7 +223,7 @@ void displayMainMenu() {
       "Demarrer Simu",
       "Regler Heure",
       "Retro: ",
-      "Test Relais"
+      "Test Output"
     };
 
     // Affiche 3 lignes autour de la sélection
@@ -342,17 +347,25 @@ void displaySetDateTimeMenu() {
   lcd.print(F("ENTER=OK RET=Ann"));
 }
 
-// === AFFICHAGE : MENU TEST RELAIS ===
-void displayRelayTestMenu() {
+// === AFFICHAGE : MENU TEST OUTPUT ===
+void displayOutputTestMenu() {
   lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(F("TEST RELAIS"));
-  lcd.setCursor(0, 1);
-  lcd.print(relayTestSelection == 0 ? F("> Relais 1  PD6 D12") : F("  Relais 1  PD6 D12"));
-  lcd.setCursor(0, 2);
-  lcd.print(relayTestSelection == 1 ? F("> Relais 2  PD7 D6 ") : F("  Relais 2  PD7 D6 "));
-  lcd.setCursor(0, 3);
-  lcd.print(F("ENTER=Act  RET=Menu"));
+  lcd.print(F("TEST OUTPUT"));
+
+  const char* outputs[] = {
+    "Relais 1 PD6D12",
+    "Relais 2 PD7D6 ",
+    "Servo 1  PB5D9 ",
+    "Servo 2  PB6D10"
+  };
+
+  for (byte i = 0; i < 4; i++) {
+    lcd.setCursor(0, i);
+    if (outputTestSelection == i) lcd.print(">");
+    else lcd.print(" ");
+    lcd.print(" ");
+    lcd.print(outputs[i]);
+  }
 }
 
 // === SIMULATION SOURIS ===
@@ -504,10 +517,10 @@ void handleMainMenuButton(int buttonIndex) {
           state.mainMenuInit = false;
           displayMainMenu();
           break;
-        case 5: // Test Relais
-          currentMenu = MENU_TEST_RELAY;
-          relayTestSelection = 0;
-          displayRelayTestMenu();
+        case 5: // Test Output
+          currentMenu = MENU_TEST_OUTPUT;
+          outputTestSelection = 0;
+          displayOutputTestMenu();
           break;
       }
       break;
@@ -569,22 +582,54 @@ void handleConfigMenuButton(int buttonIndex) {
   }
 }
 
-// === HANDLER : TEST RELAIS (NOUVEAU) ===
-void handleRelayTestMenuButton(int buttonIndex) {
+// === HANDLER : TEST OUTPUT ===
+void handleOutputTestMenuButton(int buttonIndex) {
   activateBacklight();
 
   switch (buttonIndex) {
-    case 0: // ENTER -> activer le relais sélectionné 1s
-      if (relayTestSelection == 0) { // Relais 1 (PD6/D12)
-        digitalWrite(RELAY1_PIN, HIGH);
-        delay(1000);
-        digitalWrite(RELAY1_PIN, LOW);
-      } else { // Relais 2 (PD7/D6)
-        digitalWrite(RELAY2_PIN, HIGH);
-        delay(1000);
-        digitalWrite(RELAY2_PIN, LOW);
+    case 0: // ENTER -> activer la sortie sélectionnée
+      switch (outputTestSelection) {
+        case 0: // Relais 1 (PD6/D12)
+          digitalWrite(RELAY1_PIN, HIGH);
+          delay(1000);
+          digitalWrite(RELAY1_PIN, LOW);
+          break;
+
+        case 1: // Relais 2 (PD7/D6)
+          digitalWrite(RELAY2_PIN, HIGH);
+          delay(1000);
+          digitalWrite(RELAY2_PIN, LOW);
+          break;
+
+        case 2: // Servo 1 (PB5/D9)
+          // Configurer PWM pour rotation
+          TCCR1A = _BV(COM1A1) | _BV(WGM11);
+          TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11);
+          ICR1 = 40000;
+          OCR1A = 2400;  // 1.2ms - rotation
+          delay(1000);
+          // Arrêter le servo
+          OCR1A = 3000;  // 1.5ms - neutre
+          delay(100);
+          TCCR1A &= ~_BV(COM1A1);
+          digitalWrite(SERVO1_PIN, LOW);
+          break;
+
+        case 3: // Servo 2 (PB6/D10)
+          // Configurer PWM pour rotation
+          TCCR1A = _BV(COM1B1) | _BV(WGM11);
+          TCCR1B = _BV(WGM13) | _BV(WGM12) | _BV(CS11);
+          ICR1 = 40000;
+          OCR1B = 2400;  // 1.2ms - rotation
+          delay(1000);
+          // Arrêter le servo
+          OCR1B = 3000;  // 1.5ms - neutre
+          delay(100);
+          TCCR1A &= ~_BV(COM1B1);
+          digitalWrite(SERVO2_PIN, LOW);
+          break;
       }
-      displayRelayTestMenu();
+      displayOutputTestMenu();
       break;
 
     case 1: // RETURN -> retour au menu principal
@@ -594,14 +639,14 @@ void handleRelayTestMenuButton(int buttonIndex) {
       displayMainMenu();
       break;
 
-    case 2: // UP -> changer de relais
-      relayTestSelection = (relayTestSelection == 0) ? 1 : 0;
-      displayRelayTestMenu();
+    case 2: // UP -> changer de sortie
+      outputTestSelection = (outputTestSelection == 0) ? 3 : outputTestSelection - 1;
+      displayOutputTestMenu();
       break;
 
-    case 4: // DOWN -> changer de relais
-      relayTestSelection = (relayTestSelection == 0) ? 1 : 0;
-      displayRelayTestMenu();
+    case 4: // DOWN -> changer de sortie
+      outputTestSelection = (outputTestSelection == 3) ? 0 : outputTestSelection + 1;
+      displayOutputTestMenu();
       break;
 
     // LEFT/RIGHT ignorés pour ce menu
@@ -670,6 +715,10 @@ void setup() {
   pinMode(RELAY2_PIN, OUTPUT);
   digitalWrite(RELAY1_PIN, LOW);
   digitalWrite(RELAY2_PIN, LOW);
+
+  // Servos (PWM)
+  pinMode(SERVO1_PIN, OUTPUT);
+  pinMode(SERVO2_PIN, OUTPUT);
 
   Serial.begin(9600);
   smartPrintln(F("=== Mouse Simulator v1.0 ==="));
@@ -765,8 +814,8 @@ void loop() {
                 stopMouseSimulation();
               }
               break;
-            case MENU_TEST_RELAY:
-              handleRelayTestMenuButton(i);
+            case MENU_TEST_OUTPUT:
+              handleOutputTestMenuButton(i);
               break;
             case MENU_SET_DATETIME:
               handleSetDateTimeButton(i);
